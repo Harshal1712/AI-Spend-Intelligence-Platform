@@ -1,0 +1,43 @@
+
+> ai-spend-intelligence-platform@1.0.0 dev
+> next dev -p 3000
+
+  ▲ Next.js 14.2.35
+  - Local:        http://localhost:3000
+
+ ✓ Starting...
+ ✓ Ready in 3s
+ ○ Compiling / ...
+ ✓ Compiled / in 9.2s (2324 modules)
+ GET / 200 in 9747ms
+ ✓ Compiled in 704ms (1166 modules)
+ GET / 200 in 535ms
+ GET / 200 in 63ms
+ GET / 200 in 410ms
+ ✓ Compiled in 900ms (1166 modules)
+ ✓ Compiled in 241ms (1166 modules)
+ ✓ Compiled in 36.3s (2315 modules)
+ ✓ Compiled in 3s (2315 modules)
+ ✓ Compiled in 13.7s (2315 modules)
+ ✓ Compiled in 14.8s (2315 modules)
+ ✓ Compiled in 6.5s (2315 modules)
+ ✓ Compiled in 7.5s (2315 modules)
+ ✓ Compiled in 5.6s (2315 modules)
+ ✓ Compiled in 239ms (1166 modules)
+ ✓ Compiled in 199ms (1166 modules)
+ ○ Compiling /api/dashboard ...
+ ✓ Compiled /api/dashboard in 3.9s (1181 modules)
+ GET /api/dashboard 200 in 4602ms
+ ○ Compiling /api/reports/executive ...
+ ✓ Compiled /api/reports/executive in 828ms (1183 modules)
+ ✓ Compiled (1187 modules)
+ GET /api/employees?team=Engineering&q=vikram 200 in 2530ms
+ GET /api/reports/executive 200 in 2539ms
+ GET /api/employees/export 200 in 2651ms
+ ○ Compiling /api/prompts/analyze ...
+ ✓ Compiled /api/prompts/analyze in 916ms (1189 modules)
+ POST /api/prompts/analyze 200 in 1130ms
+ ○ Compiling /_error ...
+ ✓ Compiled /_error in 10.8s (2582 modules)
+ GET / 500 in 14530ms
+[?25h
