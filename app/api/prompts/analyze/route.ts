@@ -1,5 +1,7 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
-import { analyzePrompt } from "@/lib/platform-service";
+import { analyzePromptWithAI } from "@/lib/ai-analysis";
 
 export async function POST(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as { prompt?: string } | null;
@@ -8,5 +10,6 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Prompt must contain at least 8 characters." }, { status: 400 });
   }
 
-  return NextResponse.json(analyzePrompt(body.prompt));
+  const result = await analyzePromptWithAI(body.prompt);
+  return NextResponse.json(result);
 }

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSession, signOut } from "next-auth/react";
 import {
   Area,
   AreaChart,
@@ -22,7 +23,7 @@ import {
   XAxis,
   YAxis
 } from "recharts";
-import { motion } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
 import {
   Activity,
   AlertTriangle,
@@ -31,15 +32,20 @@ import {
   Bell,
   BrainCircuit,
   Building2,
+  CalendarDays,
   Check,
   ChevronRight,
   CircleDollarSign,
+  ClipboardList,
   Download,
+  ExternalLink,
   FileText,
   Gauge,
   GitBranch,
   KeyRound,
   LockKeyhole,
+  LogOut,
+  Menu,
   MessageSquareText,
   PieChart as PieIcon,
   Plus,
@@ -48,15 +54,60 @@ import {
   Settings,
   ShieldAlert,
   Sparkles,
+  Star,
   Target,
   Timer,
   TrendingUp,
+  User,
   Users,
   WandSparkles,
+  X,
   Zap
 } from "lucide-react";
 import { clsx } from "clsx";
 import type { Employee, Integration } from "@/lib/platform-data";
+
+type DateRange = "7d" | "30d" | "90d" | "all";
+
+type Notification = {
+  id: string;
+  title: string;
+  body: string;
+  severity: string;
+  channel: string;
+  read_at: string | null;
+  created_at: string;
+};
+
+type BenchmarkRow = {
+  provider: string;
+  model_name: string;
+  cost_per_1k_tokens: number;
+  speed_score: number;
+  quality_score: number;
+  productivity_score: number;
+  adoption_score: number;
+  recommendation: string;
+};
+
+type AuditLogRow = {
+  id: string;
+  actor_user_id: string | null;
+  action: string;
+  entity_type: string;
+  entity_id: string | null;
+  associated_cost: number | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+type BudgetAlert = {
+  department: string;
+  spent: number;
+  budget: number;
+  percentage: number;
+  level: "warning" | "critical";
+};
 
 const monthly = [
   { month: "Jan", cost: 62000, tokens: 920, productivity: 18, forecast: 64000 },
@@ -136,8 +187,35 @@ type PromptLog = {
   createdAt: string;
 };
 
+type DashboardPayload = {
+  metrics: {
+    totalAiSpend: number;
+    activeUsers: number;
+    monthlyCost: number;
+    tokenConsumption: number;
+    adoptionRate: number;
+    roiScore: number;
+    nextMonthForecast: number;
+    productivityImprovement: number;
+    timeSavedHours: number;
+    securityRiskScore?: number;
+    incidentCount?: number;
+  };
+  monthly?: typeof monthly;
+  departments?: typeof departments;
+  toolUsage?: typeof toolUsage;
+  integrations?: Integration[];
+};
+
 function formatMoney(value: number) {
   return `$${Math.round(value / 1000)}K`;
+}
+
+function formatLarge(value: number) {
+  if (value >= 1000000000) return `${(value / 1000000000).toFixed(2)}B`;
+  if (value >= 1000000) return `${(value / 1000000).toFixed(1)}M`;
+  if (value >= 1000) return `${Math.round(value / 1000)}K`;
+  return String(value);
 }
 
 function Card({ children, className }: { children: React.ReactNode; className?: string }) {
@@ -212,11 +290,30 @@ function CustomTooltip({ active, payload, label }: any) {
 }
 
 export default function Home() {
+  const { data: session } = useSession();
+  const userRole = (session?.user as { role?: string })?.role ?? "Admin";
+
+  // Core state
   const [employeeRows, setEmployeeRows] = useState<Employee[]>(initialEmployees);
+  const [dashboard, setDashboard] = useState<DashboardPayload & { budgetAlerts?: BudgetAlert[] }>({
+    metrics: {
+      totalAiSpend: 1420000,
+      activeUsers: 417,
+      monthlyCost: 136000,
+      tokenConsumption: 1810000000,
+      adoptionRate: 72,
+      roiScore: 4.7,
+      nextMonthForecast: 142000,
+      productivityImprovement: 43,
+      timeSavedHours: 8240,
+      securityRiskScore: 31,
+      incidentCount: 12
+    }
+  });
   const [searchQuery, setSearchQuery] = useState("");
   const [teamFilter, setTeamFilter] = useState("All Teams");
-  const [newEmployee, setNewEmployee] = useState({ name: "", team: "", department: "", tool: "ChatGPT" });
-  const [usageEntry, setUsageEntry] = useState({ employeeId: "emp-aarav", tool: "ChatGPT", prompts: 1, tokens: 25000, cost: 4.5, prompt: "" });
+  const [newEmployee, setNewEmployee] = useState({ name: "", email: "", team: "", department: "", tool: "ChatGPT" });
+  const [usageEntry, setUsageEntry] = useState({ employeeId: "emp-aarav", tool: "ChatGPT", modelName: "GPT-4o", prompts: 1, tokens: 25000, cost: 4.5, prompt: "" });
   const [promptHistory, setPromptHistory] = useState<PromptLog[]>([]);
   const [prompt, setPrompt] = useState("Summarize quarterly usage, identify teams wasting tokens, and recommend cheaper model routing without losing answer quality.");
   const [promptAnalysis, setPromptAnalysis] = useState<PromptAnalysis>({
@@ -229,6 +326,33 @@ export default function Home() {
   });
   const [integrations, setIntegrations] = useState<Integration[]>(initialIntegrations);
   const [backendStatus, setBackendStatus] = useState("Connecting");
+  const [analyzingPrompt, setAnalyzingPrompt] = useState(false);
+
+  // New feature state
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [dateRange, setDateRange] = useState<DateRange>("30d");
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [selectedEmployee, setSelectedEmployee] = useState<Employee | null>(null);
+  const [employeePrompts, setEmployeePrompts] = useState<PromptLog[]>([]);
+  const [benchmarks, setBenchmarks] = useState<BenchmarkRow[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLogRow[]>([]);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+
+  const notifRef = useRef<HTMLDivElement>(null);
+  const userMenuRef = useRef<HTMLDivElement>(null);
+
+  // Close dropdowns on outside click
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (notifRef.current && !notifRef.current.contains(e.target as Node)) setNotifOpen(false);
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) setUserMenuOpen(false);
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, []);
+
   const employeeExportUrl = useMemo(
     () => `/api/employees/export?q=${encodeURIComponent(searchQuery)}&team=${encodeURIComponent(teamFilter)}`,
     [searchQuery, teamFilter]
@@ -236,50 +360,62 @@ export default function Home() {
 
   useEffect(() => {
     const controller = new AbortController();
-
     fetch(`/api/employees?q=${encodeURIComponent(searchQuery)}&team=${encodeURIComponent(teamFilter)}`, { signal: controller.signal })
-      .then((response) => response.json())
-      .then((data: { employees: Employee[] }) => {
-        setEmployeeRows(data.employees);
-        setBackendStatus("Synced");
-      })
-      .catch((error) => {
-        if (error.name !== "AbortError") {
-          setBackendStatus("Offline cache");
-        }
-      });
-
+      .then((r) => r.json())
+      .then((data: { employees: Employee[] }) => { setEmployeeRows(data.employees); setBackendStatus("Synced"); })
+      .catch((e) => { if (e.name !== "AbortError") setBackendStatus("Offline cache"); });
     return () => controller.abort();
   }, [searchQuery, teamFilter]);
 
   useEffect(() => {
-    fetch("/api/prompts")
-      .then((response) => response.json())
-      .then((data: { prompts: PromptLog[] }) => setPromptHistory(data.prompts))
-      .catch(() => setPromptHistory([]));
+    fetch("/api/prompts").then((r) => r.json()).then((d: { prompts: PromptLog[] }) => setPromptHistory(d.prompts)).catch(() => setPromptHistory([]));
   }, []);
 
   useEffect(() => {
     fetch("/api/dashboard")
-      .then((response) => response.json())
-      .then((data: { integrations?: Integration[] }) => {
+      .then((r) => r.json())
+      .then((data: DashboardPayload & { budgetAlerts?: BudgetAlert[] }) => {
+        setDashboard(data);
         if (data.integrations) setIntegrations(data.integrations);
         setBackendStatus("Synced");
       })
       .catch(() => setBackendStatus("Offline cache"));
+  }, [dateRange]);
+
+  // Load notifications
+  useEffect(() => {
+    fetch("/api/notifications")
+      .then((r) => r.json())
+      .then((d: { notifications: Notification[] }) => {
+        setNotifications(d.notifications);
+        setUnreadCount(d.notifications.filter((n) => !n.read_at).length);
+      })
+      .catch(() => {});
+  }, []);
+
+  // Load benchmarks
+  useEffect(() => {
+    fetch("/api/benchmarks").then((r) => r.json()).then((d: { benchmarks: BenchmarkRow[] }) => setBenchmarks(d.benchmarks)).catch(() => {});
+  }, []);
+
+  // Load audit logs
+  useEffect(() => {
+    fetch("/api/audit-logs").then((r) => r.json()).then((d: { logs: AuditLogRow[] }) => setAuditLogs(d.logs ?? [])).catch(() => {});
   }, []);
 
   async function handlePromptAnalysis() {
+    setAnalyzingPrompt(true);
     const response = await fetch("/api/prompts/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt })
     });
-
     if (response.ok) {
-      setPromptAnalysis(await response.json());
-      setBackendStatus("Synced");
+      const result = await response.json();
+      setPromptAnalysis(result);
+      setBackendStatus(result.usedAI ? "AI Analysis" : "Rule Analysis");
     }
+    setAnalyzingPrompt(false);
   }
 
   async function refreshEmployees() {
@@ -297,12 +433,11 @@ export default function Home() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(newEmployee)
     });
-
     if (response.ok) {
       const data = (await response.json()) as { employee: Employee };
       setEmployeeRows((current) => [data.employee, ...current]);
       setUsageEntry((current) => ({ ...current, employeeId: data.employee.id, tool: data.employee.tool }));
-      setNewEmployee({ name: "", team: "", department: "", tool: "ChatGPT" });
+      setNewEmployee({ name: "", email: "", team: "", department: "", tool: "ChatGPT" });
       setBackendStatus("Employee added");
     }
   }
@@ -314,13 +449,13 @@ export default function Home() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(usageEntry)
     });
-
     if (response.ok) {
       const data = (await response.json()) as { analysis: PromptAnalysis };
       setPromptAnalysis(data.analysis);
       setUsageEntry((current) => ({ ...current, prompt: "" }));
       await refreshEmployees();
-      const prompts = await fetch("/api/prompts").then((item) => item.json()) as { prompts: PromptLog[] };
+      fetch("/api/dashboard").then((r) => r.json()).then((p: DashboardPayload) => setDashboard(p));
+      const prompts = await fetch("/api/prompts").then((i) => i.json()) as { prompts: PromptLog[] };
       setPromptHistory(prompts.prompts);
       setBackendStatus("Usage saved");
     }
@@ -334,6 +469,7 @@ export default function Home() {
       body: JSON.stringify({ name: integration.name, status: nextStatus })
     });
 
+
     if (response.ok) {
       const data = (await response.json()) as { integration: Integration };
       setIntegrations((current) => current.map((item) => (item.name === data.integration.name ? data.integration : item)));
@@ -341,84 +477,303 @@ export default function Home() {
     }
   }
 
+  const NAV_ITEMS: [string, typeof Gauge][] = [
+    ["Executive", Gauge], ["Employees", Users], ["Cost Intelligence", CircleDollarSign],
+    ["Productivity", TrendingUp], ["Prompt Analyzer", MessageSquareText], ["Security", ShieldAlert],
+    ["Optimization", Sparkles], ["Agents", BrainCircuit], ["Forecasting", Activity],
+    ["Benchmarking", Target], ["Reports", FileText], ["Integrations", PlugZap],
+    ["Audit Logs", ClipboardList]
+  ];
+
   return (
     <main className="relative min-h-screen">
-      <aside className="fixed left-0 top-0 z-30 hidden h-screen w-72 border-r border-line bg-black/30 p-5 backdrop-blur-xl xl:block">
+      {/* ── Employee Detail Modal ── */}
+      <AnimatePresence>
+        {selectedEmployee && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4 backdrop-blur-sm"
+            onClick={() => setSelectedEmployee(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              className="glass w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-2xl p-6 thin-scrollbar"
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex items-center gap-4">
+                  <div className="grid h-12 w-12 place-items-center rounded-full bg-cyan/15 text-2xl font-bold text-cyan">
+                    {selectedEmployee.name[0]}
+                  </div>
+                  <div>
+                    <h2 className="text-xl font-semibold text-white">{selectedEmployee.name}</h2>
+                    <p className="text-sm text-slate-400">{selectedEmployee.team} · {selectedEmployee.department}</p>
+                  </div>
+                </div>
+                <button onClick={() => setSelectedEmployee(null)} className="rounded-md p-2 text-slate-400 hover:bg-white/10 hover:text-white">
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                {[
+                  { label: "Prompts", value: String(selectedEmployee.prompts), color: "text-cyan" },
+                  { label: "Tokens", value: selectedEmployee.tokens, color: "text-mint" },
+                  { label: "Cost", value: selectedEmployee.cost, color: "text-amber" },
+                  { label: "Productivity", value: `${selectedEmployee.productivity}%`, color: "text-white" }
+                ].map(({ label, value, color }) => (
+                  <div key={label} className="rounded-lg border border-line bg-white/[0.03] p-3 text-center">
+                    <div className={`text-xl font-semibold ${color}`}>{value}</div>
+                    <div className="mt-1 text-xs text-slate-400">{label}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-4 grid grid-cols-2 gap-3">
+                <div className="rounded-md border border-line bg-white/[0.03] p-3">
+                  <div className="text-xs text-slate-400">AI Tool</div>
+                  <div className="mt-1 font-medium text-white">{selectedEmployee.tool}</div>
+                </div>
+                <div className="rounded-md border border-line bg-white/[0.03] p-3">
+                  <div className="text-xs text-slate-400">Risk Score</div>
+                  <div className={clsx("mt-1 font-semibold", selectedEmployee.risk > 50 ? "text-rose" : "text-mint")}>{selectedEmployee.risk}/100</div>
+                </div>
+              </div>
+              <div className="mt-5">
+                <h3 className="mb-3 text-sm font-semibold text-white">Prompt History</h3>
+                <div className="space-y-2 max-h-48 overflow-y-auto thin-scrollbar">
+                  {promptHistory.filter(p => p.employeeName === selectedEmployee.name).length === 0 ? (
+                    <div className="rounded-md border border-line bg-white/[0.03] p-3 text-sm text-slate-400">No prompts logged for this employee yet.</div>
+                  ) : promptHistory.filter(p => p.employeeName === selectedEmployee.name).map((entry) => (
+                    <div key={entry.id} className="rounded-md border border-line bg-white/[0.03] p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs text-slate-500">{new Date(entry.createdAt).toLocaleString("en-US")}</span>
+                        <span className={clsx("rounded-full px-2 py-0.5 text-xs", entry.riskLevel === "Elevated" ? "bg-rose/10 text-rose" : "bg-mint/10 text-mint")}>{entry.riskLevel}</span>
+                      </div>
+                      <p className="mt-1 text-sm text-slate-300 line-clamp-2">{entry.prompt}</p>
+                      <div className="mt-1 text-xs text-slate-500">Quality: {entry.quality}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Mobile Nav Drawer ── */}
+      <AnimatePresence>
+        {mobileNavOpen && (
+          <>
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="fixed inset-0 z-40 bg-black/50 xl:hidden" onClick={() => setMobileNavOpen(false)} />
+            <motion.aside initial={{ x: -288 }} animate={{ x: 0 }} exit={{ x: -288 }} transition={{ type: "spring", damping: 28, stiffness: 300 }}
+              className="fixed left-0 top-0 z-50 h-screen w-72 border-r border-line bg-black/90 p-5 backdrop-blur-xl xl:hidden">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="grid h-10 w-10 place-items-center rounded-lg bg-mint/15 text-mint"><BrainCircuit className="h-6 w-6" /></div>
+                  <div>
+                    <div className="text-sm font-semibold text-white">AI Spend Intelligence</div>
+                    <div className="text-xs text-slate-400">Enterprise command center</div>
+                  </div>
+                </div>
+                <button onClick={() => setMobileNavOpen(false)} className="rounded-md p-1.5 text-slate-400 hover:bg-white/10"><X className="h-5 w-5" /></button>
+              </div>
+              <nav className="mt-8 space-y-1">
+                {NAV_ITEMS.map(([item, Icon]) => (
+                  <a key={item} href={`#${String(item).toLowerCase().replaceAll(" ", "-")}`}
+                    onClick={() => setMobileNavOpen(false)}
+                    className="flex items-center gap-3 rounded-md px-3 py-2.5 text-sm text-slate-300 transition hover:bg-white/8 hover:text-white">
+                    <Icon className="h-4 w-4" />{item}
+                  </a>
+                ))}
+              </nav>
+            </motion.aside>
+          </>
+        )}
+      </AnimatePresence>
+
+      {/* ── Desktop Sidebar ── */}
+      <aside className="fixed left-0 top-0 z-30 hidden h-screen w-72 border-r border-line bg-black/30 p-5 backdrop-blur-xl xl:flex xl:flex-col">
         <div className="flex items-center gap-3">
-          <div className="grid h-10 w-10 place-items-center rounded-lg bg-mint/15 text-mint">
-            <BrainCircuit className="h-6 w-6" />
-          </div>
+          <div className="grid h-10 w-10 place-items-center rounded-lg bg-mint/15 text-mint"><BrainCircuit className="h-6 w-6" /></div>
           <div>
             <div className="text-sm font-semibold text-white">AI Spend Intelligence</div>
             <div className="text-xs text-slate-400">Enterprise command center</div>
           </div>
         </div>
-        <nav className="mt-8 space-y-1">
-          {[
-            ["Executive", Gauge],
-            ["Employees", Users],
-            ["Cost Intelligence", CircleDollarSign],
-            ["Productivity", TrendingUp],
-            ["Prompt Analyzer", MessageSquareText],
-            ["Security", ShieldAlert],
-            ["Optimization", Sparkles],
-            ["Agents", BrainCircuit],
-            ["Forecasting", Activity],
-            ["Benchmarking", Target],
-            ["Reports", FileText],
-            ["Integrations", PlugZap]
-          ].map(([item, Icon]) => (
-            <a key={item as string} href={`#${String(item).toLowerCase().replaceAll(" ", "-")}`} className="flex items-center gap-3 rounded-md px-3 py-2.5 text-sm text-slate-300 transition hover:bg-white/8 hover:text-white">
-              <Icon className="h-4 w-4" />
-              {item as string}
+        <nav className="mt-8 flex-1 space-y-1 overflow-y-auto thin-scrollbar">
+          {NAV_ITEMS.map(([item, Icon]) => (
+            <a key={item} href={`#${String(item).toLowerCase().replaceAll(" ", "-")}`}
+              className="flex items-center gap-3 rounded-md px-3 py-2.5 text-sm text-slate-300 transition hover:bg-white/8 hover:text-white">
+              <Icon className="h-4 w-4" />{item}
             </a>
           ))}
         </nav>
+        {/* Sidebar user info */}
+        {session?.user && (
+          <div className="mt-4 rounded-lg border border-line bg-white/[0.03] p-3">
+            <div className="flex items-center gap-3">
+              <div className="grid h-8 w-8 place-items-center rounded-full bg-cyan/15 text-sm font-bold text-cyan">
+                {session.user.name?.[0] ?? "U"}
+              </div>
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium text-white">{session.user.name}</div>
+                <div className="text-xs text-slate-400">{userRole}</div>
+              </div>
+            </div>
+          </div>
+        )}
       </aside>
 
       <div className="xl:pl-72">
-        <header className="sticky top-0 z-20 border-b border-line bg-[#06070b]/78 px-4 py-3 backdrop-blur-xl md:px-8">
-          <div className="flex items-center justify-between gap-4">
+        {/* ── Header ── */}
+        <header className="sticky top-0 z-20 border-b border-line bg-[#06070b]/78 px-4 py-3 backdrop-blur-xl md:px-6">
+          <div className="flex items-center gap-3">
+            {/* Mobile hamburger */}
+            <button onClick={() => setMobileNavOpen(true)} className="grid h-9 w-9 place-items-center rounded-md border border-line bg-white/5 text-slate-300 xl:hidden">
+              <Menu className="h-4 w-4" />
+            </button>
+
+            {/* Search */}
             <div className="flex min-w-0 flex-1 items-center gap-3 rounded-lg border border-line bg-white/5 px-3 py-2">
               <Search className="h-4 w-4 shrink-0 text-slate-400" />
-              <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} className="w-full bg-transparent text-sm text-white outline-none placeholder:text-slate-500" placeholder="Search employees, prompts, tools, reports, budgets..." />
+              <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full bg-transparent text-sm text-white outline-none placeholder:text-slate-500"
+                placeholder="Search employees, tools, departments..." />
             </div>
-            <button className="grid h-10 w-10 place-items-center rounded-md border border-line bg-white/5 text-slate-200">
-              <Bell className="h-4 w-4" />
-            </button>
-            <button className="hidden rounded-md bg-mint px-4 py-2 text-sm font-semibold text-black shadow-glow md:block">{backendStatus}</button>
+
+            {/* Date range filter */}
+            <div className="hidden items-center gap-1 rounded-lg border border-line bg-white/5 p-1 md:flex">
+              {(["7d", "30d", "90d", "all"] as DateRange[]).map((r) => (
+                <button key={r} onClick={() => setDateRange(r)}
+                  className={clsx("rounded-md px-2.5 py-1 text-xs font-medium transition", dateRange === r ? "bg-cyan text-black" : "text-slate-400 hover:text-white")}>
+                  {r === "all" ? "All" : r}
+                </button>
+              ))}
+            </div>
+
+            {/* Backend status */}
+            <span className="hidden rounded-md bg-mint/10 px-3 py-1.5 text-xs font-semibold text-mint md:block">{backendStatus}</span>
+
+            {/* Notification bell */}
+            <div ref={notifRef} className="relative">
+              <button onClick={() => setNotifOpen((o) => !o)}
+                className="relative grid h-9 w-9 place-items-center rounded-md border border-line bg-white/5 text-slate-300 hover:bg-white/10">
+                <Bell className="h-4 w-4" />
+                {unreadCount > 0 && (
+                  <span className="absolute -right-1 -top-1 grid h-4 w-4 place-items-center rounded-full bg-rose text-[9px] font-bold text-white">{unreadCount}</span>
+                )}
+              </button>
+              <AnimatePresence>
+                {notifOpen && (
+                  <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 6 }}
+                    className="absolute right-0 top-12 z-50 w-80 rounded-xl border border-line bg-black/90 shadow-card backdrop-blur-xl">
+                    <div className="flex items-center justify-between border-b border-line px-4 py-3">
+                      <span className="text-sm font-semibold text-white">Notifications</span>
+                      <span className="rounded-full bg-rose/10 px-2 py-0.5 text-xs text-rose">{unreadCount} unread</span>
+                    </div>
+                    <div className="max-h-80 overflow-y-auto thin-scrollbar">
+                      {notifications.length === 0 ? (
+                        <div className="px-4 py-6 text-center text-sm text-slate-400">No notifications</div>
+                      ) : notifications.map((n) => (
+                        <div key={n.id} className={clsx("border-b border-line px-4 py-3 last:border-0", !n.read_at && "bg-white/[0.02]")}>
+                          <div className="flex items-start gap-2">
+                            <span className={clsx("mt-1 h-2 w-2 shrink-0 rounded-full", n.severity === "Critical" ? "bg-rose" : n.severity === "High" ? "bg-amber" : "bg-cyan")} />
+                            <div>
+                              <div className="text-sm font-medium text-white">{n.title}</div>
+                              <div className="mt-0.5 text-xs text-slate-400">{n.body}</div>
+                              <div className="mt-1 text-xs text-slate-500">{new Date(n.created_at).toLocaleString("en-US")}</div>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="border-t border-line px-4 py-2">
+                      <button className="w-full text-center text-xs text-slate-400 hover:text-white" onClick={() => { setUnreadCount(0); setNotifOpen(false); }}>
+                        Mark all as read
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+
+            {/* User menu */}
+            <div ref={userMenuRef} className="relative">
+              <button onClick={() => setUserMenuOpen((o) => !o)}
+                className="grid h-9 w-9 place-items-center rounded-full border border-line bg-cyan/15 text-sm font-bold text-cyan hover:bg-cyan/25">
+                {session?.user?.name?.[0] ?? <User className="h-4 w-4" />}
+              </button>
+              <AnimatePresence>
+                {userMenuOpen && (
+                  <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 6 }}
+                    className="absolute right-0 top-12 z-50 w-52 rounded-xl border border-line bg-black/90 shadow-card backdrop-blur-xl">
+                    <div className="border-b border-line px-4 py-3">
+                      <div className="text-sm font-medium text-white">{session?.user?.name ?? "User"}</div>
+                      <div className="text-xs text-slate-400">{userRole}</div>
+                    </div>
+                    <a href="/settings/profile" className="flex items-center gap-3 px-4 py-2.5 text-sm text-slate-300 hover:bg-white/5 hover:text-white">
+                      <User className="h-4 w-4" /> Profile Settings
+                    </a>
+                    <a href="/settings/organization" className="flex items-center gap-3 px-4 py-2.5 text-sm text-slate-300 hover:bg-white/5 hover:text-white">
+                      <Building2 className="h-4 w-4" /> Organization
+                    </a>
+                    <div className="border-t border-line">
+                      <button onClick={() => signOut({ callbackUrl: "/login" })}
+                        className="flex w-full items-center gap-3 px-4 py-2.5 text-sm text-rose hover:bg-rose/5">
+                        <LogOut className="h-4 w-4" /> Sign Out
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
           </div>
         </header>
 
         <div className="mx-auto max-w-[1560px] space-y-10 px-4 py-6 md:px-8">
+
+          {/* ── Budget Alert Banners ── */}
+          {dashboard.budgetAlerts && dashboard.budgetAlerts.length > 0 && (
+            <div className="space-y-2">
+              {dashboard.budgetAlerts.map((alert) => (
+                <motion.div key={alert.department} initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}
+                  className={clsx("flex items-center gap-3 rounded-lg border px-4 py-3 text-sm",
+                    alert.level === "critical" ? "border-rose/30 bg-rose/10 text-rose" : "border-amber/30 bg-amber/10 text-amber")}>
+                  <AlertTriangle className="h-4 w-4 shrink-0" />
+                  <span><b>{alert.department}</b> has used <b>{alert.percentage.toFixed(0)}%</b> of its ${alert.budget.toLocaleString()} monthly AI budget — ${alert.spent.toLocaleString()} spent.</span>
+                  <span className={clsx("ml-auto rounded-full px-2 py-0.5 text-xs font-semibold uppercase", alert.level === "critical" ? "bg-rose/20" : "bg-amber/20")}>{alert.level}</span>
+                </motion.div>
+              ))}
+            </div>
+          )}
+
           <section id="executive" className="grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
             <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} className="glass overflow-hidden rounded-lg p-6 md:p-8">
               <div className="mb-8 flex flex-wrap items-start justify-between gap-5">
                 <div>
                   <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-mint/25 bg-mint/10 px-3 py-1 text-xs font-semibold text-mint">
-                    <Zap className="h-3.5 w-3.5" />
-                    Real-time AI governance cockpit
+                    <Zap className="h-3.5 w-3.5" /> Real-time AI governance cockpit
                   </div>
                   <h1 className="max-w-4xl text-4xl font-semibold tracking-[-0.02em] text-white md:text-6xl">AI Spend Intelligence Platform</h1>
                   <p className="mt-4 max-w-2xl text-base leading-7 text-slate-300">
-                    Monitor AI subscriptions, API usage, employee adoption, security exposure, productivity lift, and executive ROI from every enterprise AI tool.
+                    Monitor AI subscriptions, API usage, employee adoption, security exposure, productivity lift, and executive ROI.
                   </p>
                 </div>
                 <div className="rounded-lg border border-line bg-black/25 p-4">
                   <div className="text-xs uppercase tracking-[0.18em] text-slate-500">ROI score</div>
-                  <div className="mt-2 text-5xl font-semibold text-mint">4.7x</div>
+                  <div className="mt-2 text-5xl font-semibold text-mint">{dashboard.metrics.roiScore}x</div>
                   <div className="mt-2 flex items-center gap-1 text-sm text-mint"><ArrowUpRight className="h-4 w-4" /> 18% this month</div>
                 </div>
               </div>
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                <MetricCard icon={CircleDollarSign} label="Total AI Spend" value="$1.42M" delta="+14.2%" />
-                <MetricCard icon={Users} label="Active Users" value="417" delta="+21" tone="cyan" />
-                <MetricCard icon={Activity} label="Token Consumption" value="1.81B" delta="+9.4%" tone="amber" />
-                <MetricCard icon={Timer} label="Time Saved Using AI" value="8,240h" delta="+31%" />
-                <MetricCard icon={Building2} label="Monthly Cost" value="$136K" delta="+12.4%" tone="rose" />
-                <MetricCard icon={Target} label="AI Adoption Rate" value="72%" delta="+8%" tone="cyan" />
-                <MetricCard icon={TrendingUp} label="Next Month Forecast" value="$142K" delta="+4.4%" tone="amber" />
-                <MetricCard icon={Gauge} label="Productivity Improvement" value="43%" delta="+5%" />
+                <MetricCard icon={CircleDollarSign} label="Total AI Spend" value={formatMoney(dashboard.metrics.totalAiSpend)} delta="+14.2%" />
+                <MetricCard icon={Users} label="Active Users" value={String(dashboard.metrics.activeUsers)} delta="+21" tone="cyan" />
+                <MetricCard icon={Activity} label="Token Consumption" value={formatLarge(dashboard.metrics.tokenConsumption)} delta="+9.4%" tone="amber" />
+                <MetricCard icon={Timer} label="Time Saved" value={`${dashboard.metrics.timeSavedHours.toLocaleString("en-US")}h`} delta="+31%" />
+                <MetricCard icon={Building2} label="Monthly Cost" value={formatMoney(dashboard.metrics.monthlyCost)} delta="+12.4%" tone="rose" />
+                <MetricCard icon={Target} label="AI Adoption Rate" value={`${dashboard.metrics.adoptionRate}%`} delta="+8%" tone="cyan" />
+                <MetricCard icon={TrendingUp} label="Next Month Forecast" value={formatMoney(dashboard.metrics.nextMonthForecast)} delta="+4.4%" tone="amber" />
+                <MetricCard icon={Gauge} label="Security Risk Score" value={`${dashboard.metrics.securityRiskScore ?? 31}/100`} delta={`${dashboard.metrics.incidentCount ?? 12} incidents`} />
               </div>
             </motion.div>
 
@@ -428,7 +783,7 @@ export default function Home() {
                 <span className="rounded-full bg-mint/10 px-2 py-1 text-xs text-mint">Board ready</span>
               </div>
               <div className="mt-6 space-y-4">
-                {["$31.4K potential monthly savings identified", "3 security incidents require review", "Engineering delivers highest AI productivity ROI", "Copilot and Cursor outperform generic chat for developer workflows"].map((item) => (
+                {["$31.4K potential monthly savings identified", "3 security incidents require review", "Engineering delivers highest AI productivity ROI", "Copilot and Cursor outperform generic chat for devs"].map((item) => (
                   <div key={item} className="flex gap-3 rounded-md border border-line bg-white/[0.03] p-3">
                     <Check className="mt-0.5 h-4 w-4 shrink-0 text-mint" />
                     <span className="text-sm text-slate-300">{item}</span>
@@ -437,12 +792,9 @@ export default function Home() {
               </div>
               <div className="mt-6 rounded-lg border border-line bg-black/25 p-4">
                 <div className="mb-3 flex items-center justify-between text-sm">
-                  <span className="text-slate-400">Budget utilization</span>
-                  <span className="text-white">84%</span>
+                  <span className="text-slate-400">Budget utilization</span><span className="text-white">84%</span>
                 </div>
-                <div className="h-2 rounded-full bg-white/10">
-                  <div className="h-full w-[84%] rounded-full bg-gradient-to-r from-mint to-cyan" />
-                </div>
+                <div className="h-2 rounded-full bg-white/10"><div className="h-full w-[84%] rounded-full bg-gradient-to-r from-mint to-cyan" /></div>
               </div>
             </Card>
           </section>
@@ -450,25 +802,19 @@ export default function Home() {
           <section className="grid gap-4 lg:grid-cols-2">
             <ChartShell title="Monthly Cost Trend">
               <ResponsiveContainer>
-                <AreaChart data={monthly}>
-                  <defs>
-                    <linearGradient id="cost" x1="0" x2="0" y1="0" y2="1">
-                      <stop stopColor="#37f5b1" stopOpacity={0.38} />
-                      <stop offset="1" stopColor="#37f5b1" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
+                <AreaChart data={dashboard.monthly ?? monthly}>
+                  <defs><linearGradient id="cost" x1="0" x2="0" y1="0" y2="1"><stop stopColor="#37f5b1" stopOpacity={0.38} /><stop offset="1" stopColor="#37f5b1" stopOpacity={0} /></linearGradient></defs>
                   <CartesianGrid stroke="rgba(148,163,184,.1)" vertical={false} />
-                  <XAxis dataKey="month" stroke="#94a3b8" />
-                  <YAxis stroke="#94a3b8" tickFormatter={formatMoney} />
+                  <XAxis dataKey="month" stroke="#94a3b8" /><YAxis stroke="#94a3b8" tickFormatter={formatMoney} />
                   <Tooltip content={<CustomTooltip />} />
                   <Area dataKey="cost" name="Cost" stroke="#37f5b1" fill="url(#cost)" strokeWidth={2} />
                   <Line dataKey="forecast" name="Forecast" stroke="#46d5ff" strokeDasharray="5 5" strokeWidth={2} />
                 </AreaChart>
               </ResponsiveContainer>
             </ChartShell>
-            <ChartShell title="Cost vs Productivity Graph">
+            <ChartShell title="Cost vs Productivity">
               <ResponsiveContainer>
-                <ComposedChart data={monthly}>
+                <ComposedChart data={dashboard.monthly ?? monthly}>
                   <CartesianGrid stroke="rgba(148,163,184,.1)" vertical={false} />
                   <XAxis dataKey="month" stroke="#94a3b8" />
                   <YAxis yAxisId="left" stroke="#94a3b8" tickFormatter={formatMoney} />
@@ -486,46 +832,40 @@ export default function Home() {
             <Card>
               <div className="mb-5 grid gap-4 xl:grid-cols-[0.9fr_1.1fr]">
                 <form onSubmit={handleCreateEmployee} className="rounded-lg border border-line bg-white/[0.03] p-4">
-                  <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-white">
-                    <Plus className="h-4 w-4 text-cyan" />
-                    Add employee
-                  </div>
+                  <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-white"><Plus className="h-4 w-4 text-cyan" /> Add employee</div>
                   <div className="grid gap-3 sm:grid-cols-2">
-                    <input required value={newEmployee.name} onChange={(event) => setNewEmployee((current) => ({ ...current, name: event.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Employee name" />
-                    <input required value={newEmployee.team} onChange={(event) => setNewEmployee((current) => ({ ...current, team: event.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Team" />
-                    <input required value={newEmployee.department} onChange={(event) => setNewEmployee((current) => ({ ...current, department: event.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Department" />
-                    <select value={newEmployee.tool} onChange={(event) => setNewEmployee((current) => ({ ...current, tool: event.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none">
-                      {["ChatGPT", "Claude", "Gemini", "GitHub Copilot", "Cursor", "Windsurf", "Perplexity", "Internal LLM"].map((tool) => <option key={tool}>{tool}</option>)}
+                    <input required value={newEmployee.name} onChange={(e) => setNewEmployee((c) => ({ ...c, name: e.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Employee name" />
+                    <input required type="email" value={newEmployee.email} onChange={(e) => setNewEmployee((c) => ({ ...c, email: e.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Work email" />
+                    <input required value={newEmployee.team} onChange={(e) => setNewEmployee((c) => ({ ...c, team: e.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Team" />
+                    <input required value={newEmployee.department} onChange={(e) => setNewEmployee((c) => ({ ...c, department: e.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Department" />
+                    <select value={newEmployee.tool} onChange={(e) => setNewEmployee((c) => ({ ...c, tool: e.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none">
+                      {["ChatGPT", "Claude", "Gemini", "GitHub Copilot", "Cursor", "Windsurf", "Perplexity", "Internal LLM"].map((t) => <option key={t}>{t}</option>)}
                     </select>
                   </div>
                   <button className="mt-3 flex items-center gap-2 rounded-md bg-cyan px-3 py-2 text-sm font-semibold text-black"><Plus className="h-4 w-4" /> Add employee</button>
                 </form>
-
                 <form onSubmit={handleAddUsage} className="rounded-lg border border-line bg-white/[0.03] p-4">
-                  <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-white">
-                    <MessageSquareText className="h-4 w-4 text-cyan" />
-                    Add AI usage and prompt
-                  </div>
+                  <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-white"><MessageSquareText className="h-4 w-4 text-cyan" /> Log AI usage</div>
                   <div className="grid gap-3 md:grid-cols-3">
-                    <select value={usageEntry.employeeId} onChange={(event) => setUsageEntry((current) => ({ ...current, employeeId: event.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none">
-                      {employeeRows.map((employee) => <option key={employee.id} value={employee.id}>{employee.name}</option>)}
+                    <select value={usageEntry.employeeId} onChange={(e) => setUsageEntry((c) => ({ ...c, employeeId: e.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none">
+                      {employeeRows.map((emp) => <option key={emp.id} value={emp.id}>{emp.name}</option>)}
                     </select>
-                    <select value={usageEntry.tool} onChange={(event) => setUsageEntry((current) => ({ ...current, tool: event.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none">
-                      {["ChatGPT", "Claude", "Gemini", "GitHub Copilot", "Cursor", "Windsurf", "Perplexity", "Internal LLM"].map((tool) => <option key={tool}>{tool}</option>)}
+                    <select value={usageEntry.tool} onChange={(e) => setUsageEntry((c) => ({ ...c, tool: e.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none">
+                      {["ChatGPT", "Claude", "Gemini", "GitHub Copilot", "Cursor", "Windsurf", "Perplexity", "Internal LLM"].map((t) => <option key={t}>{t}</option>)}
                     </select>
-                    <input type="number" min="1" value={usageEntry.prompts} onChange={(event) => setUsageEntry((current) => ({ ...current, prompts: Number(event.target.value) }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Prompts" />
-                    <input type="number" min="0" value={usageEntry.tokens} onChange={(event) => setUsageEntry((current) => ({ ...current, tokens: Number(event.target.value) }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Tokens" />
-                    <input type="number" min="0" step="0.01" value={usageEntry.cost} onChange={(event) => setUsageEntry((current) => ({ ...current, cost: Number(event.target.value) }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Cost" />
+                    <input value={usageEntry.modelName} onChange={(e) => setUsageEntry((c) => ({ ...c, modelName: e.target.value }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Model name" />
+                    <input type="number" min="1" value={usageEntry.prompts} onChange={(e) => setUsageEntry((c) => ({ ...c, prompts: Number(e.target.value) }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Prompts" />
+                    <input type="number" min="0" value={usageEntry.tokens} onChange={(e) => setUsageEntry((c) => ({ ...c, tokens: Number(e.target.value) }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Tokens" />
+                    <input type="number" min="0" step="0.01" value={usageEntry.cost} onChange={(e) => setUsageEntry((c) => ({ ...c, cost: Number(e.target.value) }))} className="rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Cost $" />
                     <button className="flex items-center justify-center gap-2 rounded-md bg-mint px-3 py-2 text-sm font-semibold text-black"><Check className="h-4 w-4" /> Save usage</button>
                   </div>
-                  <textarea required value={usageEntry.prompt} onChange={(event) => setUsageEntry((current) => ({ ...current, prompt: event.target.value }))} className="mt-3 h-20 w-full resize-none rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Prompt submitted by the employee..." />
+                  <textarea required value={usageEntry.prompt} onChange={(e) => setUsageEntry((c) => ({ ...c, prompt: e.target.value }))} className="mt-3 h-20 w-full resize-none rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white outline-none" placeholder="Prompt submitted by the employee..." />
                 </form>
               </div>
-
               <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-                <div className="flex gap-2">
-                  {["All Teams", "Engineering", "Sales", "Marketing", "High Risk"].map((filter) => (
-                    <button key={filter} onClick={() => setTeamFilter(filter)} className={clsx("rounded-md border border-line px-3 py-2 text-xs text-slate-300 hover:bg-white/10", teamFilter === filter ? "bg-cyan/10 text-cyan" : "bg-white/5")}>{filter}</button>
+                <div className="flex flex-wrap gap-2">
+                  {["All Teams", "Engineering", "Sales", "Marketing", "High Risk"].map((f) => (
+                    <button key={f} onClick={() => setTeamFilter(f)} className={clsx("rounded-md border border-line px-3 py-2 text-xs text-slate-300 hover:bg-white/10", teamFilter === f ? "bg-cyan/10 text-cyan" : "bg-white/5")}>{f}</button>
                   ))}
                 </div>
                 <a href={employeeExportUrl} className="flex items-center gap-2 rounded-md bg-white px-3 py-2 text-xs font-semibold text-black"><Download className="h-4 w-4" /> Export CSV</a>
@@ -533,22 +873,27 @@ export default function Home() {
               <div className="thin-scrollbar overflow-x-auto">
                 <table className="w-full min-w-[980px] text-left text-sm">
                   <thead className="text-xs uppercase tracking-[0.12em] text-slate-500">
-                    <tr>{["Employee Name", "Team", "Department", "AI Tool Used", "Prompts Sent", "Tokens Consumed", "Monthly Cost", "Productivity Score", "Last Active Date", "Risk Score"].map((h) => <th key={h} className="border-b border-line px-3 py-3">{h}</th>)}</tr>
+                    <tr>{["Employee Name", "Team", "Department", "AI Tool", "Prompts", "Tokens", "Cost", "Productivity", "Last Active", "Risk"].map((h) => <th key={h} className="border-b border-line px-3 py-3">{h}</th>)}</tr>
                   </thead>
                   <tbody>
-                    {employeeRows.map((employee) => (
-                      <tr key={employee.name} className="border-b border-line/70 text-slate-300 hover:bg-white/[0.03]">
-                        {[employee.name, employee.team, employee.department, employee.tool, employee.prompts, employee.tokens, employee.cost, employee.productivity, employee.lastActive].map((cell, idx) => (
-                          <td key={`${employee.name}-${idx}`} className="px-3 py-4">{cell}</td>
-                        ))}
-                        <td className="px-3 py-4">
-                          <span className={clsx("rounded-full px-2 py-1 text-xs", employee.risk > 50 ? "bg-rose/10 text-rose" : "bg-mint/10 text-mint")}>{employee.risk}</span>
-                        </td>
+                    {employeeRows.map((emp) => (
+                      <tr key={emp.id} className="cursor-pointer border-b border-line/70 text-slate-300 hover:bg-white/[0.03]" onClick={() => setSelectedEmployee(emp)}>
+                        <td className="px-3 py-4 font-medium text-white">{emp.name}</td>
+                        <td className="px-3 py-4">{emp.team}</td>
+                        <td className="px-3 py-4">{emp.department}</td>
+                        <td className="px-3 py-4">{emp.tool}</td>
+                        <td className="px-3 py-4">{emp.prompts}</td>
+                        <td className="px-3 py-4">{emp.tokens}</td>
+                        <td className="px-3 py-4">{emp.cost}</td>
+                        <td className="px-3 py-4">{emp.productivity}%</td>
+                        <td className="px-3 py-4">{emp.lastActive}</td>
+                        <td className="px-3 py-4"><span className={clsx("rounded-full px-2 py-1 text-xs", emp.risk > 50 ? "bg-rose/10 text-rose" : "bg-mint/10 text-mint")}>{emp.risk}</span></td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
+              <p className="mt-3 text-xs text-slate-500">Click any row to view employee details and prompt history.</p>
             </Card>
           </section>
 
@@ -564,13 +909,12 @@ export default function Home() {
             </div>
             <ChartShell title="Department Cost Breakdown">
               <ResponsiveContainer>
-                <BarChart data={departments}>
+                <BarChart data={dashboard.departments ?? departments}>
                   <CartesianGrid stroke="rgba(148,163,184,.1)" vertical={false} />
-                  <XAxis dataKey="name" stroke="#94a3b8" />
-                  <YAxis stroke="#94a3b8" tickFormatter={formatMoney} />
+                  <XAxis dataKey="name" stroke="#94a3b8" /><YAxis stroke="#94a3b8" tickFormatter={formatMoney} />
                   <Tooltip content={<CustomTooltip />} />
                   <Bar dataKey="value" name="Cost" radius={[4, 4, 0, 0]}>
-                    {departments.map((_, index) => <Cell key={index} fill={colors[index % colors.length]} />)}
+                    {(dashboard.departments ?? departments).map((_, i) => <Cell key={i} fill={colors[i % colors.length]} />)}
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
@@ -582,10 +926,9 @@ export default function Home() {
               <SectionTitle icon={TrendingUp} eyebrow="Productivity intelligence" title="Measure the business impact of AI usage" />
               <ChartShell title="Productivity Growth Chart">
                 <ResponsiveContainer>
-                  <LineChart data={monthly}>
+                  <LineChart data={dashboard.monthly ?? monthly}>
                     <CartesianGrid stroke="rgba(148,163,184,.1)" vertical={false} />
-                    <XAxis dataKey="month" stroke="#94a3b8" />
-                    <YAxis stroke="#94a3b8" />
+                    <XAxis dataKey="month" stroke="#94a3b8" /><YAxis stroke="#94a3b8" />
                     <Tooltip content={<CustomTooltip />} />
                     <Line dataKey="productivity" name="Productivity %" stroke="#37f5b1" strokeWidth={3} />
                     <Line dataKey="tokens" name="Token Usage" stroke="#46d5ff" strokeWidth={2} />
@@ -595,7 +938,7 @@ export default function Home() {
             </div>
             <Card className="lg:mt-[68px]">
               <h3 className="font-semibold text-white">AI Impact Reports</h3>
-              {["Top team: Platform Engineering", "Top user: Vikram Rao", "Most efficient department: Support", "Output quality score: 87/100"].map((item) => (
+              {["Top team: Platform Engineering", "Top user: Vikram Rao", "Most efficient dept: Support", "Output quality score: 87/100"].map((item) => (
                 <div key={item} className="mt-4 rounded-md border border-line bg-white/[0.03] p-3 text-sm text-slate-300">{item}</div>
               ))}
             </Card>
@@ -605,14 +948,26 @@ export default function Home() {
             <div>
               <SectionTitle icon={MessageSquareText} eyebrow="Prompt intelligence" title="Analyze, optimize, and govern prompt quality" />
               <Card>
-                <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} className="h-40 w-full resize-none rounded-md border border-line bg-black/30 p-4 text-sm text-slate-200 outline-none placeholder:text-slate-500" placeholder="Paste a prompt to analyze complexity, cost, leakage risk, and output quality..." />
-                <button onClick={handlePromptAnalysis} className="mt-4 flex items-center gap-2 rounded-md bg-cyan px-4 py-2 text-sm font-semibold text-black"><WandSparkles className="h-4 w-4" /> Analyze and improve prompt</button>
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-xs text-slate-400">Paste a prompt to analyze it</span>
+                  {(promptAnalysis as { usedAI?: boolean }).usedAI && (
+                    <span className="flex items-center gap-1 rounded-full bg-mint/10 px-2 py-0.5 text-xs text-mint"><Star className="h-3 w-3" /> AI-powered</span>
+                  )}
+                </div>
+                <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)}
+                  className="h-40 w-full resize-none rounded-md border border-line bg-black/30 p-4 text-sm text-slate-200 outline-none placeholder:text-slate-500"
+                  placeholder="Paste a prompt to analyze complexity, cost, leakage risk, and output quality..." />
+                <button onClick={handlePromptAnalysis} disabled={analyzingPrompt}
+                  className="mt-4 flex items-center gap-2 rounded-md bg-cyan px-4 py-2 text-sm font-semibold text-black disabled:opacity-60">
+                  <WandSparkles className="h-4 w-4" />
+                  {analyzingPrompt ? "Analyzing..." : "Analyze and improve prompt"}
+                </button>
               </Card>
               <Card className="mt-4">
                 <h3 className="font-semibold text-white">Employee Prompt History</h3>
                 <div className="mt-4 max-h-72 space-y-3 overflow-auto thin-scrollbar">
                   {promptHistory.length === 0 ? (
-                    <div className="rounded-md border border-line bg-white/[0.03] p-3 text-sm text-slate-400">No employee prompts logged yet. Add usage above to populate this history.</div>
+                    <div className="rounded-md border border-line bg-white/[0.03] p-3 text-sm text-slate-400">No prompts logged yet. Add usage above to populate history.</div>
                   ) : promptHistory.map((entry) => (
                     <div key={entry.id} className="rounded-md border border-line bg-white/[0.03] p-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -620,7 +975,7 @@ export default function Home() {
                         <span className={clsx("rounded-full px-2 py-1 text-xs", entry.riskLevel === "Elevated" ? "bg-rose/10 text-rose" : "bg-mint/10 text-mint")}>{entry.riskLevel}</span>
                       </div>
                       <p className="mt-2 text-sm text-slate-300">{entry.prompt}</p>
-                      <div className="mt-2 text-xs text-slate-400">Quality {entry.quality} - {new Date(entry.createdAt).toLocaleString("en-US")}</div>
+                      <div className="mt-2 text-xs text-slate-400">Quality {entry.quality} — {new Date(entry.createdAt).toLocaleString("en-US")}</div>
                     </div>
                   ))}
                 </div>
@@ -629,7 +984,7 @@ export default function Home() {
             <Card className="lg:mt-[68px]">
               <div className="grid gap-4 sm:grid-cols-3">
                 {[["Quality", promptAnalysis.quality], ["Efficiency", promptAnalysis.efficiency], ["Complexity", promptAnalysis.complexity]].map(([label, score]) => (
-                  <div key={label} className="rounded-lg border border-line bg-white/[0.03] p-4">
+                  <div key={label as string} className="rounded-lg border border-line bg-white/[0.03] p-4">
                     <div className="text-sm text-slate-400">{label}</div>
                     <div className="mt-2 text-3xl font-semibold text-white">{score}</div>
                     <div className="mt-3 h-2 rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-mint to-cyan" style={{ width: `${score}%` }} /></div>
@@ -640,6 +995,10 @@ export default function Home() {
                 <div className="rounded-md border border-line bg-black/25 p-4 text-sm text-slate-300"><b className="text-white">Suggestions</b><br />{promptAnalysis.suggestions.join(" ")}</div>
                 <div className="rounded-md border border-mint/30 bg-mint/10 p-4 text-sm text-slate-200"><b className="text-mint">Improved Prompt</b><br />{promptAnalysis.improvedPrompt}</div>
               </div>
+              <div className="mt-4 rounded-md border border-line bg-white/[0.02] p-3">
+                <div className="mb-1 text-xs text-slate-400">Risk level</div>
+                <span className={clsx("rounded-full px-3 py-1 text-sm font-semibold", promptAnalysis.riskLevel === "Elevated" ? "bg-rose/15 text-rose" : "bg-mint/15 text-mint")}>{promptAnalysis.riskLevel}</span>
+              </div>
             </Card>
           </section>
 
@@ -647,8 +1006,8 @@ export default function Home() {
             <div>
               <SectionTitle icon={ShieldAlert} eyebrow="Security and compliance" title="Detect leakage, violations, and sensitive AI behavior" />
               <div className="grid gap-3 sm:grid-cols-2">
-                <MetricCard icon={LockKeyhole} label="Security Risk Score" value="31/100" delta="-9%" />
-                <MetricCard icon={AlertTriangle} label="Incident Count" value="12" delta="+3" tone="rose" />
+                <MetricCard icon={LockKeyhole} label="Security Risk Score" value={`${dashboard.metrics.securityRiskScore ?? 31}/100`} delta="-9%" />
+                <MetricCard icon={AlertTriangle} label="Incident Count" value={String(dashboard.metrics.incidentCount ?? 12)} delta="+3" tone="rose" />
                 <MetricCard icon={KeyRound} label="API Key Leakage" value="2" delta="open" tone="amber" />
                 <MetricCard icon={Check} label="Compliance Status" value="94%" delta="+4%" tone="cyan" />
               </div>
@@ -672,12 +1031,7 @@ export default function Home() {
           <section id="optimization">
             <SectionTitle icon={Sparkles} eyebrow="Cost optimization engine" title="Savings recommendations ranked by financial impact" />
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-              {[
-                ["Move GPT-4 workflows to GPT-4o-mini", "$14.2K/mo", "Low quality risk"],
-                ["Remove inactive Claude seats", "$6.8K/mo", "41 idle users"],
-                ["Compress repetitive support prompts", "$5.1K/mo", "Token waste detected"],
-                ["Route code search to internal LLM", "$5.3K/mo", "Data stays private"]
-              ].map(([title, savings, detail]) => (
+              {[["Move GPT-4 workflows to GPT-4o-mini", "$14.2K/mo", "Low quality risk"], ["Remove inactive Claude seats", "$6.8K/mo", "41 idle users"], ["Compress repetitive support prompts", "$5.1K/mo", "Token waste detected"], ["Route code search to internal LLM", "$5.3K/mo", "Data stays private"]].map(([title, savings, detail]) => (
                 <Card key={title}>
                   <div className="text-sm text-slate-400">{detail}</div>
                   <h3 className="mt-3 min-h-12 text-lg font-semibold text-white">{title}</h3>
@@ -704,7 +1058,7 @@ export default function Home() {
                   <div className="mt-4 h-2 rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-cyan to-mint" style={{ width: `${health}%` }} /></div>
                   <div className="mt-2 text-xs text-slate-400">Health score {health}%</div>
                   <div className="mt-4 rounded-md border border-line bg-black/25 p-3 text-sm text-slate-300">{recommendation}</div>
-                  <div className="mt-3 flex items-center gap-2 text-xs text-slate-500"><GitBranch className="h-3.5 w-3.5" /> Step {index + 1} synced: {metric}</div>
+                  <div className="mt-3 flex items-center gap-2 text-xs text-slate-500"><GitBranch className="h-3.5 w-3.5" /> Step {index + 1}: {metric}</div>
                 </Card>
               ))}
             </div>
@@ -715,16 +1069,10 @@ export default function Home() {
               <SectionTitle icon={Activity} eyebrow="Predictive analytics" title="Machine learning forecasts for AI spend and adoption" />
               <ChartShell title="Future Spend and Token Usage Projections">
                 <ResponsiveContainer>
-                  <AreaChart data={monthly}>
-                    <defs>
-                      <linearGradient id="tokens" x1="0" x2="0" y1="0" y2="1">
-                        <stop stopColor="#46d5ff" stopOpacity={0.35} />
-                        <stop offset="1" stopColor="#46d5ff" stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
+                  <AreaChart data={dashboard.monthly ?? monthly}>
+                    <defs><linearGradient id="tokens" x1="0" x2="0" y1="0" y2="1"><stop stopColor="#46d5ff" stopOpacity={0.35} /><stop offset="1" stopColor="#46d5ff" stopOpacity={0} /></linearGradient></defs>
                     <CartesianGrid stroke="rgba(148,163,184,.1)" vertical={false} />
-                    <XAxis dataKey="month" stroke="#94a3b8" />
-                    <YAxis stroke="#94a3b8" />
+                    <XAxis dataKey="month" stroke="#94a3b8" /><YAxis stroke="#94a3b8" />
                     <Tooltip content={<CustomTooltip />} />
                     <Area dataKey="tokens" name="Tokens" stroke="#46d5ff" fill="url(#tokens)" strokeWidth={2} />
                   </AreaChart>
@@ -739,12 +1087,13 @@ export default function Home() {
             </Card>
           </section>
 
-          <section id="benchmarking" className="grid gap-4 lg:grid-cols-[0.75fr_1.25fr]">
-            <div>
-              <SectionTitle icon={Target} eyebrow="Tool benchmarking" title="Compare AI tools by cost, accuracy, speed, and adoption" />
+          {/* ── Benchmarking — Now with live API data ── */}
+          <section id="benchmarking">
+            <SectionTitle icon={Target} eyebrow="Tool benchmarking" title="Compare AI tools by cost, accuracy, speed, and productivity" />
+            <div className="grid gap-4 lg:grid-cols-[0.75fr_1.25fr]">
               <Card>
                 <ResponsiveContainer width="100%" height={290}>
-                  <RadarChart data={toolUsage}>
+                  <RadarChart data={dashboard.toolUsage ?? toolUsage}>
                     <PolarGrid stroke="rgba(148,163,184,.18)" />
                     <PolarAngleAxis dataKey="tool" tick={{ fill: "#cbd5e1", fontSize: 11 }} />
                     <Radar dataKey="productivity" stroke="#37f5b1" fill="#37f5b1" fillOpacity={0.25} />
@@ -753,19 +1102,34 @@ export default function Home() {
                   </RadarChart>
                 </ResponsiveContainer>
               </Card>
+              <Card>
+                <h3 className="mb-4 text-sm font-semibold text-white">Model Benchmark Comparison</h3>
+                <div className="thin-scrollbar overflow-x-auto">
+                  <table className="w-full min-w-[600px] text-left text-sm">
+                    <thead className="text-xs uppercase tracking-wider text-slate-500">
+                      <tr>
+                        {["Provider", "Model", "Cost/1K", "Speed", "Quality", "Productivity", "Recommendation"].map((h) => (
+                          <th key={h} className="border-b border-line px-3 py-2">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {benchmarks.map((b) => (
+                        <tr key={`${b.provider}-${b.model_name}`} className="border-b border-line/60 text-slate-300 hover:bg-white/[0.02]">
+                          <td className="px-3 py-3 font-medium text-white">{b.provider}</td>
+                          <td className="px-3 py-3">{b.model_name}</td>
+                          <td className="px-3 py-3 text-amber">${b.cost_per_1k_tokens.toFixed(4)}</td>
+                          <td className="px-3 py-3"><div className="flex items-center gap-2"><div className="h-1.5 w-16 rounded-full bg-white/10"><div className="h-full rounded-full bg-cyan" style={{ width: `${b.speed_score}%` }} /></div><span>{b.speed_score}</span></div></td>
+                          <td className="px-3 py-3"><div className="flex items-center gap-2"><div className="h-1.5 w-16 rounded-full bg-white/10"><div className="h-full rounded-full bg-mint" style={{ width: `${b.quality_score}%` }} /></div><span>{b.quality_score}</span></div></td>
+                          <td className="px-3 py-3"><span className={clsx("rounded-full px-2 py-0.5 text-xs", b.productivity_score >= 90 ? "bg-mint/15 text-mint" : b.productivity_score >= 80 ? "bg-cyan/15 text-cyan" : "bg-white/10 text-slate-300")}>{b.productivity_score}</span></td>
+                          <td className="px-3 py-3 max-w-[200px] text-slate-400">{b.recommendation}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
             </div>
-            <ChartShell title="AI Tool Usage Comparison">
-              <ResponsiveContainer>
-                <BarChart data={toolUsage}>
-                  <CartesianGrid stroke="rgba(148,163,184,.1)" vertical={false} />
-                  <XAxis dataKey="tool" stroke="#94a3b8" />
-                  <YAxis stroke="#94a3b8" />
-                  <Tooltip content={<CustomTooltip />} />
-                  <Bar dataKey="adoption" name="Adoption Rate" fill="#37f5b1" radius={[4, 4, 0, 0]} />
-                  <Bar dataKey="productivity" name="Productivity" fill="#46d5ff" radius={[4, 4, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            </ChartShell>
           </section>
 
           <section id="reports" className="grid gap-4 lg:grid-cols-[1fr_0.9fr]">
@@ -773,22 +1137,21 @@ export default function Home() {
               <SectionTitle icon={FileText} eyebrow="Executive reporting center" title="CEO-friendly business reporting and ROI narratives" />
               <Card>
                 <div className="grid gap-4 md:grid-cols-2">
-                  {["Total AI Investment: $1.42M", "Total Productivity Gain: 43%", "Estimated Time Saved: 8,240 hours", "Cost of Inaction: $2.8M annual opportunity loss", "Risk Assessment: Moderate", "AI Adoption Status: Scaling", "Department Performance: Engineering leads", "Strategic Recommendation: Optimize model routing"].map((report) => (
+                  {["Total AI Investment: $1.42M", "Total Productivity Gain: 43%", "Estimated Time Saved: 8,240 hours", "Cost of Inaction: $2.8M annual opportunity loss", "Risk Assessment: Moderate", "AI Adoption Status: Scaling", "Dept Performance: Engineering leads", "Strategic Rec: Optimize model routing"].map((report) => (
                     <div key={report} className="rounded-md border border-line bg-white/[0.03] p-4 text-sm text-slate-300">{report}</div>
                   ))}
                 </div>
                 <div className="mt-5 flex flex-wrap gap-3">
                   <a href="/api/reports/executive/pdf" className="flex items-center gap-2 rounded-md border border-line bg-white/5 px-4 py-2 text-sm text-white hover:bg-white/10"><Download className="h-4 w-4" /> Download PDF</a>
-                  <button className="flex items-center gap-2 rounded-md border border-line bg-white/5 px-4 py-2 text-sm text-white hover:bg-white/10"><Download className="h-4 w-4" /> Share Report</button>
-                  <a href={employeeExportUrl} className="flex items-center gap-2 rounded-md border border-line bg-white/5 px-4 py-2 text-sm text-white hover:bg-white/10"><Download className="h-4 w-4" /> Export Analytics</a>
+                  <a href={employeeExportUrl} className="flex items-center gap-2 rounded-md border border-line bg-white/5 px-4 py-2 text-sm text-white hover:bg-white/10"><Download className="h-4 w-4" /> Export CSV</a>
                 </div>
               </Card>
             </div>
             <ChartShell title="Department Cost Pie Chart">
               <ResponsiveContainer>
                 <PieChart>
-                  <Pie data={departments} innerRadius={62} outerRadius={100} dataKey="value" nameKey="name" paddingAngle={3}>
-                    {departments.map((_, index) => <Cell key={index} fill={colors[index % colors.length]} />)}
+                  <Pie data={dashboard.departments ?? departments} innerRadius={62} outerRadius={100} dataKey="value" nameKey="name" paddingAngle={3}>
+                    {(dashboard.departments ?? departments).map((_, i) => <Cell key={i} fill={colors[i % colors.length]} />)}
                   </Pie>
                   <Tooltip content={<CustomTooltip />} />
                 </PieChart>
@@ -817,23 +1180,61 @@ export default function Home() {
             <Card className="lg:mt-[68px]">
               <div className="flex items-center gap-3">
                 <Settings className="h-5 w-5 text-cyan" />
-                <h3 className="font-semibold text-white">Role and policy controls</h3>
+                <h3 className="font-semibold text-white">Role & Policy Controls</h3>
               </div>
-              <div className="mt-5 grid gap-3 sm:grid-cols-2">
-                {["Admin", "Manager", "Employee", "Executive"].map((role) => (
-                  <div key={role} className="rounded-md border border-line bg-white/[0.03] p-4">
-                    <div className="font-medium text-white">{role}</div>
-                    <div className="mt-2 text-sm text-slate-400">Budget, data, prompt, and report permissions configured.</div>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                {[["Admin", "Full platform access"], ["Manager", "Dept-scoped analytics"], ["Employee", "Personal usage only"], ["CEO", "Company-wide ROI & reports"]].map(([role, desc]) => (
+                  <div key={role} className={clsx("rounded-md border border-line bg-white/[0.03] p-4", userRole === role && "border-cyan/30 bg-cyan/5")}>
+                    <div className="flex items-center justify-between">
+                      <div className="font-medium text-white">{role}</div>
+                      {userRole === role && <span className="rounded-full bg-cyan/15 px-2 py-0.5 text-xs text-cyan">You</span>}
+                    </div>
+                    <div className="mt-1 text-sm text-slate-400">{desc}</div>
                   </div>
                 ))}
               </div>
-              <div className="mt-5 rounded-lg border border-cyan/25 bg-cyan/10 p-4 text-sm text-slate-200">
-                Notification rules are active for budget thresholds, abnormal spending, security incidents, productivity drops, and subscription renewals.
+              <div className="mt-5 flex gap-2">
+                <a href="/settings/organization" className="flex items-center gap-2 rounded-md bg-cyan px-3 py-2 text-sm font-semibold text-black"><Settings className="h-4 w-4" /> Organization Settings</a>
+                <a href="/settings/profile" className="flex items-center gap-2 rounded-md border border-line bg-white/5 px-3 py-2 text-sm text-white hover:bg-white/10"><User className="h-4 w-4" /> Profile</a>
               </div>
             </Card>
           </section>
+
+          {/* ── Audit Logs ── */}
+          <section id="audit-logs">
+            <SectionTitle icon={ClipboardList} eyebrow="Compliance & audit trail" title="Every action logged for security and compliance review" />
+            <Card>
+              {auditLogs.length === 0 ? (
+                <div className="rounded-md border border-line bg-white/[0.03] p-6 text-center">
+                  <ClipboardList className="mx-auto h-8 w-8 text-slate-400" />
+                  <p className="mt-3 text-sm text-slate-400">Audit logs appear here when the database is connected and actions are performed (employee creation, usage logging, etc.).</p>
+                </div>
+              ) : (
+                <div className="thin-scrollbar overflow-x-auto">
+                  <table className="w-full min-w-[700px] text-left text-sm">
+                    <thead className="text-xs uppercase tracking-wider text-slate-500">
+                      <tr>{["Action", "Entity Type", "Entity ID", "Cost", "Time"].map((h) => <th key={h} className="border-b border-line px-3 py-2">{h}</th>)}</tr>
+                    </thead>
+                    <tbody>
+                      {auditLogs.slice(0, 50).map((log) => (
+                        <tr key={log.id} className="border-b border-line/60 text-slate-300 hover:bg-white/[0.02]">
+                          <td className="px-3 py-3 font-medium text-white">{log.action}</td>
+                          <td className="px-3 py-3">{log.entity_type}</td>
+                          <td className="px-3 py-3 text-slate-500 text-xs">{log.entity_id ?? "—"}</td>
+                          <td className="px-3 py-3">{log.associated_cost != null ? `$${log.associated_cost.toFixed(2)}` : "—"}</td>
+                          <td className="px-3 py-3 text-slate-400">{new Date(log.created_at).toLocaleString("en-US")}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </Card>
+          </section>
+
         </div>
       </div>
     </main>
   );
 }
+

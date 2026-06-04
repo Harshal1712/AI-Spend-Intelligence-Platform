@@ -1,20 +1,30 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
-import { createEmployee, searchEmployees } from "@/lib/platform-service";
+import { createEmployeeInDb, listEmployeesFromDb } from "@/lib/postgres-repository";
+import { rateLimit } from "@/lib/rate-limit";
 
 export async function GET(request: NextRequest) {
+  const limited = rateLimit(request);
+  if (limited) return limited;
+
   const { searchParams } = new URL(request.url);
   const query = searchParams.get("q") ?? "";
   const team = searchParams.get("team") ?? "All Teams";
 
   return NextResponse.json({
-    employees: searchEmployees({ query, team }),
+    employees: await listEmployeesFromDb({ queryText: query, team }),
     filters: { query, team }
   });
 }
 
 export async function POST(request: NextRequest) {
+  const limited = rateLimit(request);
+  if (limited) return limited;
+
   const body = (await request.json().catch(() => null)) as {
     name?: string;
+    email?: string;
     team?: string;
     department?: string;
     tool?: string;
@@ -23,13 +33,13 @@ export async function POST(request: NextRequest) {
   } | null;
 
   try {
-    const employee = createEmployee({
+    const employee = await createEmployeeInDb({
       name: body?.name ?? "",
+      email: body?.email ?? `${Date.now()}@local.employee`,
       team: body?.team ?? "",
       department: body?.department ?? "",
       tool: body?.tool ?? "",
-      productivity: body?.productivity,
-      risk: body?.risk
+      role: "Employee"
     });
 
     return NextResponse.json({ employee }, { status: 201 });
